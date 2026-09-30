@@ -27,6 +27,8 @@ Start at `main()` in [`main.go`](./main.go):
 
 `service` does not keep a local quota map or cache. Both API processes consult the same Redis state.
 
+Each process creates one `redis.Client`, which is concurrency-safe and uses an internal connection pool. This repository leaves pool settings at the `go-redis/v9` defaults: a base pool size of `10 * GOMAXPROCS` per client, opened on demand rather than all at startup. Because `MaxActiveConns` is not set, that base size is not a hard maximum. See [ARCHITECTURE.md](./ARCHITECTURE.md#5-redis-client-connections) for production sizing implications.
+
 ## 3. Follow an evaluation request
 
 The local example policy in the README gives `tenant-42` in namespace `search` two rules:
@@ -102,7 +104,7 @@ These are implemented in one loop so rules use the same Redis timestamp and a si
 
 `evaluate` increments process-local counters, sets `X-RateLimit-Remaining` and `X-RateLimit-Reset`, and adds `Retry-After` to denials. It returns HTTP 200 for either a computed allow or deny; check the JSON `allowed` field to know the decision. A missing policy returns 404, invalid input returns 4xx, and Redis errors return 503.
 
-The `Retry-After` value is an estimate, not a reservation. Another request may consume the available quota before a caller retries.
+For each blocking rule, `retry_after_ms` is the wait until that rule can accept the requested cost: time until the fixed window resets, or time to refill the missing tokens in a token bucket. The top-level retry is the maximum among blocking rules. It is omitted from JSON when zero, normally on an allowed response. It is an estimate, not a reservation; another request may consume the available quota before a caller retries.
 
 ## 4. Read quota without spending it
 
@@ -141,7 +143,7 @@ Each configured rule has a separate hash for its quota value and timestamp:
 ratelimit:{<pair-hash>}:state:<name>:<algorithm>:<capacity>:<period-ms>
 ```
 
-State keys get an expiry when a successful evaluation writes them. The expiry removes inactive quota state; it is not the algorithm's reset time. Policy keys have no TTL. Compose enables Redis AOF and a persistent named volume to support local restart recovery, but this single Redis instance is not a backup or an HA setup. More details are in [ARCHITECTURE.md](./ARCHITECTURE.md#4-redis-keys-persistence-and-expiry).
+State keys get an expiry when a successful evaluation writes them. The expiry removes inactive quota state; it is not the algorithm's reset time. Policy keys have no TTL. Compose enables Redis AOF and a persistent named volume to support local restart recovery, but Redis retains its default `appendfsync everysec` policy: a host/power failure can lose roughly the most recent second of acknowledged changes. This is not a backup or an HA setup. More details are in [ARCHITECTURE.md](./ARCHITECTURE.md#4-redis-keys-persistence-and-expiry).
 
 ## 7. Metrics and health
 

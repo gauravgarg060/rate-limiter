@@ -109,7 +109,6 @@ Example response (timestamps and fractional values vary with request timing):
   "allowed": true,
   "remaining": 19,
   "reset_at": "2026-09-30T08:40:00Z",
-  "retry_after_ms": 0,
   "instance_id": "api1",
   "rules": [
     {
@@ -135,6 +134,8 @@ Example response (timestamps and fractional values vary with request timing):
 The response also includes `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers; a denial includes `Retry-After`. A successfully computed allow **or deny** returns HTTP 200—callers must check the JSON `allowed` field. The limiter does not execute the protected business operation; an upstream service or gateway decides whether to proceed or return HTTP 429 to its own caller. If the limiter cannot reach Redis, it returns 503 and does not grant permission.
 
 The top-level `remaining` is the smallest numeric remaining amount across the rules. Since rules can have different algorithms and periods, use each rule's `remaining` and `reset_at` fields for the precise quota signal. Retry times are estimates; a subsequent request may see a different balance.
+
+`retry_after_ms` is omitted when it is zero (normally, on an allowed response). On a denial, it is based on the rules currently blocking the request. A fixed-window rule reports time until its window resets; a token bucket reports time until it has enough tokens for the requested cost. When multiple rules block, the top-level value is the longest of those waits. The per-rule signals identify which rule is blocking and include its retry estimate.
 
 ## Inspect current quota
 
@@ -192,7 +193,7 @@ Each API instance exposes `/metrics` with process-local counters for evaluations
 The local stack is intended for a trusted laptop/interview demo:
 
 - **Redis is a single point of failure.** Compose runs one Redis node without HA, authentication, or TLS. The service fails closed with 503 if Redis is unavailable. Lua atomicity protects against concurrent interleaving on the active Redis primary; it does not provide failover or lossless durability.
-- **Policies and quota state share Redis.** Compose enables AOF and a persistent volume for restart recovery, but this is not an independent policy database or a backup strategy. A production design could store policies in ZooKeeper or another durable configuration system and push versioned snapshots into API-instance memory. Redis would still be needed for shared, globally correct quota counters.
+- **Policies and quota state share Redis, and writes are not zero-loss durable.** Compose enables AOF and a persistent volume, but leaves Redis at its default `appendfsync everysec`; an abrupt host/power failure can lose roughly the most recent second of acknowledged writes. AOF is not replication or a backup. Define a recovery-point objective and test backup/restore and failover for production. A production design could store policies in ZooKeeper or another durable configuration system and push versioned snapshots into API-instance memory. Redis would still be needed for shared, globally correct quota counters.
 - **Identity is trusted from the request.** The service accepts the supplied `identifier` and `namespace`; evaluation and state endpoints do not authenticate callers. Put it behind a trusted identity gateway or add caller authentication and bind credentials to tenant identity before public exposure.
 - **The admin credential is demo-grade.** The default admin token is public in this README. Replace it locally and use a managed secret plus stronger authorization in any real deployment.
 - **Metrics are basic and unauthenticated.** Counters are per-process, with no latency histograms or tracing. Restrict access to `/metrics` to trusted operators/scrapers in production.

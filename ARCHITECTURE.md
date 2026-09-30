@@ -119,7 +119,15 @@ Quota-state keys receive a Redis TTL when a successful evaluation writes them. T
 
 The Compose Redis command enables AOF and stores Redis data in a named Docker volume. This helps Redis restore data on container restart while the volume is retained. It is not a backup or a highly available store; Redis's default AOF fsync policy can still lose recent writes in a host/power failure. Removing the volume removes that persisted data.
 
-## 5. Why concurrent requests do not overspend
+More precisely, Compose starts Redis with `--appendonly yes` but does not change Redis's default `appendfsync everysec` setting. Redis acknowledges a write before every such write is necessarily fsynced to disk; a machine or power failure can therefore lose roughly the most recent second of acknowledged policy and quota writes (the exact amount depends on timing and failure mode). AOF is not replication, a backup, or a zero-loss guarantee. Production durability requires an explicit recovery-point objective, tested backups/restore, and a persistence/failover configuration appropriate to that objective.
+
+## 5. Redis client connections
+
+Each running API process constructs one `redis.Client` in `main()` and shares that concurrency-safe client across its request handlers. The client maintains a connection pool; requests borrow a connection while sending commands and return it to the pool when finished. The integration test's two API servers each use a separate client, just as two deployed processes do.
+
+This repository does not set pool options explicitly. With the pinned `go-redis/v9` version, the default base pool size is `10 * runtime.GOMAXPROCS(0)` per client. This is a pool sizing target, not a promise that that many TCP connections are opened at startup: connections are created as needed. `MaxActiveConns` is left at its default of zero, which means there is no explicit hard cap; when demand exceeds the base pool size, the library can allocate additional connections. Pool wait duration and active/idle connections therefore depend on runtime CPU settings and traffic. For a production deployment, explicitly size and cap the pool from measured concurrency and Redis capacity, and monitor pool timeouts and connection counts.
+
+## 6. Why concurrent requests do not overspend
 
 `runQuotaScript` submits one Redis Lua script invocation for an evaluation. The script contains several Redis commands (`GET`, `TIME`, `HMGET`, and, for an allowed decision, `HSET`/`PEXPIRE`), but Redis runs the script without interleaving another client's commands in the middle of it. This script execution is the decision's serialization point on the Redis primary.
 
@@ -135,7 +143,7 @@ The race windows and boundaries are:
 
 The HTTP contention test sends 100 concurrent requests through two independent `httptest` API servers and expects exactly 17 allows. It then reads quota state through the other instance. The test requires a Redis service and is run in GitHub Actions with Redis available. Algorithm tests also cover token refill and an AND policy where denial by one rule must not partially charge another.
 
-## 6. Configuration and state inspection
+## 7. Configuration and state inspection
 
 `PUT /v1/rules?identifier=...&namespace=...` validates and replaces the complete policy JSON in Redis. Configuration calls must include the configured admin bearer token in the `Authorization` header. `GET` reads the policy. `DELETE` with `name=...` removes one rule atomically; without `name`, it deletes the policy.
 
@@ -143,15 +151,16 @@ Configuration is stored in Redis for this demo so all instances see changes imme
 
 `GET /v1/state?identifier=...&namespace=...` runs the same quota calculations in read-only mode. It reports current consumption, remaining capacity, and reset time without spending quota or extending state TTL. Since other evaluations can run immediately before or after the read, this is a snapshot, not a reservation or guarantee that the returned balance will still be available to the next request.
 
-## 7. Health, metrics, and errors
+## 8. Health, metrics, and errors
 
 - `GET /healthz` currently pings Redis as well as handling the request. It returns 200 when Redis is reachable and 503 otherwise. There is no separate process-only liveness endpoint, so this endpoint is best treated as a combined readiness check.
 - `GET /metrics` emits Prometheus text-format process-local counters for evaluations, allow/deny decisions, and errors. Each instance must be scraped separately and counters reset on process restart. The endpoint does not use Redis and has no authentication in this demo.
 - An allow or deny is a successfully computed evaluation and returns 200. Callers must inspect the `allowed` field. The limiter answers whether the caller may proceed; an upstream application or gateway decides whether to execute the business operation or return HTTP 429 to its caller.
+- For each blocking rule, `retry_after_ms` estimates when that rule can accept the requested cost. For a fixed window, it is the time remaining until the aligned window reset. For a token bucket, it is the time needed to refill the missing tokens: `ceil((cost - available_tokens) * period_ms / capacity)`. The top-level `retry_after_ms` is the maximum wait among blocking rules, because the request cannot pass until every blocking rule permits it. The JSON field is omitted when its value is zero (`omitempty`), normally on allowed responses. It is an estimate: the caller is not reserving the quota, and another request may consume it first.
 - A 503 means the service could not safely make a quota decision. Treat it as no permission to proceed (fail closed).
 - The response includes an instance ID but not a unique request ID. There is no retry deduplication. A lost response after consumption is ambiguous to the caller.
 
-## 8. What this implementation does not claim
+## 9. What this implementation does not claim
 
 The local Compose stack is an interview/demo deployment, not production hardening:
 

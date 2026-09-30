@@ -144,6 +144,18 @@ An operator calls the authenticated `PUT /v1/rules` API. The policy JSON is stor
 
 Quota-state hashes get a TTL to clean up inactive state; the TTL is not the reset time. Token-bucket expiry is delayed long enough that an expired bucket would have refilled to full. Policy keys do not expire. An identical rule recreated before its prior state expires can reuse that state.
 
+### How many Redis connections does each API instance use?
+
+Each API process constructs one concurrency-safe `go-redis` client, which maintains a connection pool. We do not configure pool options explicitly. In the pinned client version, the default base pool size is 10 times `GOMAXPROCS` per client; connections are opened as traffic needs them, not all at startup. Since `MaxActiveConns` is unset, the base size is not a hard maximum. For production, set explicit pool limits based on load testing and monitor pool waits and Redis connection counts.
+
+### What is the Redis durability guarantee?
+
+Compose enables AOF and stores Redis data in a named volume, but leaves Redis's default `appendfsync everysec` policy. Redis may acknowledge a write before it is fsynced, so a host or power failure can lose roughly the most recent second of acknowledged policy or quota updates. This is basic local restart recovery, not zero-loss durability, replication, backup, or HA. A production service needs a stated recovery-point objective plus tested backups and failover.
+
+### How is `retry_after_ms` calculated, and which rule is blocking?
+
+Every blocking rule reports its own retry estimate. A fixed-window rule uses time remaining until the aligned window ends. A token bucket estimates how long it takes to refill the missing tokens: `ceil((cost - available_tokens) * period_ms / capacity)`. The top-level retry is the **maximum** across blocking rules, since all blockers must clear. Zero retry values are omitted from JSON, so the top-level field normally appears on denials only. It is only an estimate—another request can use quota before the retry arrives. Check `rules[].name` and `rules[].retry_after_ms` to see the individual blockers.
+
 ### Do two APIs really share state in the tests?
 
 The HTTP contention integration test runs two independent `httptest` API servers with separate Redis clients against the same Redis service and sends concurrent requests to both. It verifies the combined allowed count and then reads shared quota state through an instance. The local Compose demo runs actual separate API containers. Be precise: the integration test demonstrates two API server instances, not two separately launched OS processes.
