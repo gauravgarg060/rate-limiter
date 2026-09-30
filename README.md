@@ -6,7 +6,7 @@ Each policy is selected by an `(identifier, namespace)` pair—for example, tena
 
 The local demo runs two API instances against the same Redis. Both instances use a Redis Lua script to evaluate and update quota state atomically, so a tenant does not get a separate allowance per API replica.
 
-> This project is an interview/demo implementation, not a hardened public production service. Read [ARCHITECTURE.md](./ARCHITECTURE.md) for the request flow, contention guarantees, Redis data model, outage behavior, and production follow-up.
+> This project is an interview/demo implementation, not a hardened public production service. Read [CODE_WALKTHROUGH.md](./CODE_WALKTHROUGH.md) to follow a request through the code, and [ARCHITECTURE.md](./ARCHITECTURE.md) for the system diagram, contention guarantees, Redis data model, outage behavior, and production follow-up.
 
 ## Run locally with Docker Compose
 
@@ -162,6 +162,8 @@ The response reports consumed and remaining amounts, plus reset timestamps, per 
 For the state and policy endpoints, supply `identifier` and `namespace` as query parameters. Evaluation takes both in its JSON request body.
 
 ## Tests and CI
+
+For a guided tour of the implementation and tests, see [CODE_WALKTHROUGH.md](./CODE_WALKTHROUGH.md).
 
 Run the validation commands:
 
