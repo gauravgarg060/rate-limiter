@@ -1,68 +1,165 @@
-# Architecture and correctness
+# Architecture and operational behavior
 
-## Request lifecycle
+This document describes the service in this repository: a Go HTTP API that stores policy and quota state in Redis, and uses a Redis Lua script to make globally shared quota decisions across API instances. The local Docker Compose stack has two API containers, one Redis container, and an Nginx proxy.
+
+## 1. Components and request flow
 
 ```mermaid
-flowchart LR
-    C[Caller] -->|POST /v1/evaluate| LB[Local Nginx proxy]
-    LB --> A1[API instance 1]
-    LB --> A2[API instance 2]
-    C -->|direct request / metrics| A1
-    C -->|direct request / metrics| A2
-    A1 --> V[Validate identity, namespace, cost]
-    A2 --> V
-    V -->|one EVALSHA / Lua invocation| R[(Shared Redis)]
-    R --> P[Read policy]
-    P --> S[Read all named rule states]
-    S --> D{All rules allow cost?}
-    D -->|yes: update all rule states| U[Commit quota state]
-    D -->|no: no state writes| N[Return denial and retry time]
-    U --> O[Return allow, remaining, reset, per-rule signals]
-    N --> O
-    O --> C
-    R -. GET state via read-only script .-> Q[Quota-state endpoint]
-    Q --> C
-    G[Admin client] -->|PUT / GET / DELETE policy| A1
-    G -->|PUT / GET / DELETE policy| A2
-    A1 -. configuration operations .-> R
-    A2 -. configuration operations .-> R
-    M[Metrics scraper] -->|GET /metrics| A1
-    M -->|GET /metrics| A2
+flowchart TB
+    caller[Caller or upstream gateway]
+    admin[Trusted operator]
+    scraper[Metrics scraper]
+    proxy[Nginx local load balancer]
+    api1[Go API instance 1]
+    api2[Go API instance 2]
+    redis[(Shared Redis)]
+
+    caller -->|POST /v1/evaluate| proxy
+    proxy --> api1
+    proxy --> api2
+    caller -->|Optional direct instance access| api1
+    caller -->|Optional direct instance access| api2
+
+    subgraph evaluation[Evaluation path]
+        validate[Validate JSON, identifier, namespace, and cost]
+        script[Run one quota Lua script]
+        loadPolicy[Read policy JSON]
+        loadState[Read state for each named rule]
+        decision{Does every rule have enough capacity?}
+        commit[Write every rule state]
+        result[Return decision, remaining quota, reset, and rule signals]
+        validate --> script
+        script --> loadPolicy
+        loadPolicy --> loadState
+        loadState --> decision
+        decision -->|Yes: consume cost from every rule| commit
+        decision -->|No: leave every quota key unchanged| result
+        commit --> result
+    end
+
+    api1 --> validate
+    api2 --> validate
+    script <-->|Single non-interleaved script execution| redis
+    result -->|HTTP 200 with allowed true or false| caller
+
+    admin -->|PUT, GET, or DELETE /v1/rules| api1
+    admin -->|PUT, GET, or DELETE /v1/rules| api2
+    api1 <-->|Read or atomically change policy| redis
+    api2 <-->|Read or atomically change policy| redis
+
+    caller -->|GET /v1/state| api1
+    caller -->|GET /v1/state| api2
+    api1 -->|Read-only script mode| redis
+    api2 -->|Read-only script mode| redis
+
+    scraper -->|GET /metrics on each instance| api1
+    scraper -->|GET /metrics on each instance| api2
 ```
 
-The API instances keep no quota state in process memory. Policy and quota keys use a hash of the complete `(identifier, namespace)` pair, avoiding raw identifiers in Redis key names and ensuring all state keys for one policy share a Redis Cluster hash slot. `api1` and `api2` in Compose use separate processes and clients but the same Redis service.
+Nginx is only part of the local demo. In a deployment without it, a caller or external load balancer can send requests to any API instance. The API instances hold no local quota counters: they all use the same Redis service. The caller's `identifier` and `namespace` select a policy; they are not authenticated by this service, so a real deployment must derive or validate identity at a trusted gateway or add service-side caller authentication.
 
-## Contention and linearizability
+## 2. One evaluation, step by step
 
-Evaluation calls one Redis Lua script with the policy key. Redis executes a script without interleaving commands from another client. Within that invocation, the service reads the current policy, reads every rule state, computes the decision, and—only when all rules pass—writes every updated rule state. This is the serialization point for evaluations on that Redis primary.
+For `POST /v1/evaluate`:
 
-For `N` simultaneous unit-cost requests against a fresh capacity `C`, all requests are ordered by Redis script execution. Exactly `min(N, C)` can consume that rule's tokens/window; later invocations see the committed state and deny. The cross-instance contention test sends 100 concurrent HTTP requests through two independent API servers and requires exactly 17 allows against a capacity of 17. It then inspects state through the other instance.
+1. The API decodes one JSON object and rejects malformed or unknown fields. It validates that `identifier` and `namespace` are present and within their size limits. `cost` defaults to 1 and must be a positive integer no greater than 1,000,000.
+2. The API derives a Redis policy key from the SHA-256 hash of the identifier and namespace. This avoids putting raw identifiers into Redis key names.
+3. The API invokes the Lua script through the Redis client. The script reads the current policy and gets the current time from Redis, not from the API host clock.
+4. For each configured rule, the script reads that rule's state and computes its current available quota. Rules are constraints combined with AND: all must permit the requested cost.
+5. If any rule denies the cost, the script writes no quota-state updates. If every rule permits it, the script updates all rule states before returning the decision.
+6. The API returns HTTP 200 for a successfully computed decision, whether allowed or denied. The JSON body includes `allowed`, remaining quota, reset information, the handling instance ID, and per-rule quota signals. A denial includes a retry estimate and `Retry-After` header.
 
-There is no read/decision/write gap across Redis commands and no local-cache replication lag in this design. The bounded contention is Redis's single-threaded script queue: requests may wait behind the script, but they cannot both observe and spend the same capacity. Runtime policy writes are atomic `SET`s and individual rule deletion is a Lua script. A concurrent evaluation therefore uses the policy value Redis presents at its own script serialization point; it is not guaranteed to use a policy version selected before the request arrived. State keys include rule name, algorithm, capacity, and period, so changing those attributes starts fresh quota state. Recreating a deleted rule with identical attributes can reuse its state until its TTL expires.
+Requests with no configured policy return 404. Invalid requests, including a cost greater than any rule's capacity, return 4xx. Redis/backend failures return 503; the service does not invent an allow decision when it cannot check the shared quota.
 
-Redis scripting is atomic with respect to interleaving, but Redis does not roll back earlier writes if a script fails after a write. The quota script computes and validates the complete decision before issuing writes and then performs a short sequence of known `HSET`/`PEXPIRE` operations. Operational Redis failures, failover, persistence settings, and operator intervention can still affect durability; atomic execution alone is not a durability guarantee.
+The evaluation script handles at most eight rules per policy. Its Redis work is bounded by that configured maximum; it does not make one separate network round trip per rule.
 
-## Algorithm choices
+## 3. Algorithms and state
 
-- **Token bucket** is used for burst shaping. It starts full, refills continuously at `capacity / period_seconds`, and supports short bursts without allowing more than its configured capacity at once.
-- **Fixed window** is simple for sustained periodic quotas and produces a precise aligned reset timestamp. It can allow a boundary burst split across adjacent windows; pair it with a token bucket when that behavior is undesirable.
-- Multiple named rules compose as an AND: a request is consumed from every rule only when every rule can pay its cost. A rejection consumes from none.
+Each rule has a name, algorithm, capacity, and period in seconds.
 
-## Policy distribution trade-off
+### Token bucket
 
-This demo stores policy JSON in Redis alongside the quota state. That keeps the implementation small and makes policy updates immediately visible to all instances, but it couples policy availability and durability to Redis. AOF and a persistent volume help with restart recovery; they do not provide an independent policy source of truth or high availability.
+- A new bucket starts full, with `capacity` tokens.
+- Tokens refill continuously at `capacity / period_seconds` tokens per second, up to the configured capacity.
+- A request of cost `c` is allowed when at least `c` tokens are available; the script subtracts `c` on an allowed decision.
+- The bucket is stored lazily: its saved value and timestamp are used to calculate refill when a request or state read occurs. A read-only state request does not write the newly calculated value back.
+- Token counts can be fractional internally. Reported quota values can therefore contain a small fractional remainder, even when they are close to zero.
 
-An alternative production architecture is to keep policies in ZooKeeper (or another durable, strongly coordinated configuration store) and have API instances maintain an in-memory policy snapshot. Instances load a snapshot on startup, subscribe to versioned change notifications, and atomically replace their local snapshot when updates arrive. This removes a policy read from the evaluation path and lets existing instances continue with their last known policy during a configuration-store outage.
+### Fixed window
 
-That alternative introduces its own consistency and lifecycle requirements: instances can briefly enforce different policy versions while an update propagates; watchers must recover after disconnects by fetching a fresh snapshot; new instances must not serve until they have loaded a valid snapshot; deletes and rollbacks need versioned events; and operators need to monitor per-instance policy versions. It does not replace Redis for this design's exact cross-instance quota counters. If Redis is unavailable, instances cannot safely make globally correct quota decisions merely by having policies cached in memory; this service should still fail closed unless a different, explicitly bounded degraded-mode contract is designed.
+- Time is divided into aligned windows of `period_seconds`.
+- Each window tracks its consumed request cost. Its count starts at zero when the script first evaluates that window.
+- A request is allowed only when current usage plus its cost is no greater than capacity.
+- The reset time is the end of the current aligned window.
+- This is simple for periodic quotas, but a caller can use quota near the end of one window and again at the start of the next. Pair it with a token bucket when this boundary burst is unacceptable.
 
-## Known limits and production follow-up
+### Several rules together
 
-- The local Compose Redis is one unauthenticated, non-TLS node. It is for a trusted laptop/demo only, not a high-availability production deployment.
-- There is no Redis Sentinel/Cluster failover orchestration, backup/restore validation, or defined behavior during Redis outage beyond returning `503` (fail closed).
-- Policies are stored in Redis rather than a separate configuration source. For stronger independent policy durability and lower evaluation-path configuration reads, use ZooKeeper or another durable configuration store with versioned watches and instance-local snapshots; account for propagation lag and watcher recovery. This does not remove Redis as the shared quota-state dependency.
-- Policy reads/writes and state inspection do not have tenant/admin RBAC beyond a single shared bearer token for configuration. Evaluation/state endpoints assume an authenticated upstream gateway.
-- Redis is the single serialization and throughput bottleneck for a hot policy key. A distributed design cannot avoid coordination while preserving exact global quotas; partitioning by policy key distributes distinct tenants, but one tenant's hot key remains serialized.
-- `/metrics` counters are process-local and reset on restart. Scrape each instance and aggregate externally; no tenant labels are emitted.
-- Redis Lua scripts access derived state keys sharing the policy hash tag. Verify the Redis Cluster version/configuration and script key-access rules before moving this single-Redis Compose deployment to Cluster.
-- Idempotency keys, audit history, policy version preconditions, rate-limited administrative operations, authentication for callers, and load/latency benchmarks remain future production work.
+A policy can combine token-bucket and fixed-window rules. For example, `burst` can allow 20 requests per 10-second refill interval, while `sustained` allows 100 per aligned minute. Both must allow the request. When the request is allowed, its cost is charged against every rule; if one denies it, none of the rules are charged.
+
+The top-level `remaining` field is the smallest remaining capacity across the rules, not a new independent quota. Per-rule fields are the precise values to inspect when diagnosing a decision. For denied decisions, `retry_after_ms` is based on the longest retry estimate among denying rules, because all blocking constraints must clear.
+
+## 4. Redis keys, persistence, and expiry
+
+For `(identifier, namespace)`, the policy key has the form:
+
+```text
+ratelimit:{<sha256(identifier + NUL + namespace)>}:policy
+```
+
+Quota state is stored separately for each rule:
+
+```text
+ratelimit:{<same-hash>}:state:<name>:<algorithm>:<capacity>:<period-ms>
+```
+
+The key includes the rule's algorithm and parameters. Changing a rule's name, algorithm, capacity, or period therefore selects a different state key and starts fresh state for that configuration. Old state keys expire eventually; if an identical configuration is recreated before expiry, it may reuse the old state.
+
+Quota-state keys receive a Redis TTL when a successful evaluation writes them. Token-bucket state expires after at least the larger of two refill periods or 60 seconds; fixed-window state expires after two windows. The TTL is cleanup for inactive state, not the quota's reset time. A read-only state request does not extend the TTL. Policy keys do not have a TTL and are removed by the configuration delete API.
+
+The Compose Redis command enables AOF and stores Redis data in a named Docker volume. This helps Redis restore data on container restart while the volume is retained. It is not a backup or a highly available store; Redis's default AOF fsync policy can still lose recent writes in a host/power failure. Removing the volume removes that persisted data.
+
+## 5. Why concurrent requests do not overspend
+
+`runQuotaScript` submits one Redis Lua script invocation for an evaluation. The script contains several Redis commands (`GET`, `TIME`, `HMGET`, and, for an allowed decision, `HSET`/`PEXPIRE`), but Redis runs the script without interleaving another client's commands in the middle of it. This script execution is the decision's serialization point on the Redis primary.
+
+For a fresh unit-cost quota with capacity 17 and 100 simultaneous requests, Redis orders the 100 script invocations. With the test's slow refill period, the first 17 consume the available quota and later invocations see the updated state and deny. A token bucket can refill while requests queue, so exactly 17 is a property of the test's timing/configuration, not a universal result for every load or refill rate. Two API processes do not create two independent allowances because neither owns a local counter.
+
+The race windows and boundaries are:
+
+- **Between separate client-side read and write commands:** none for the quota decision, because check and update happen in one server-side Lua invocation rather than separate API-issued commands or a `MULTI`/`EXEC` transaction.
+- **Between evaluations:** each complete script is serialized on Redis; requests can queue behind one another, especially on a hot key. The configured limit of eight rules bounds the per-script rule loop, not Redis queue length or end-to-end latency.
+- **Between a policy update and an evaluation:** `PUT` uses Redis `SET`, and deleting one named rule uses a Lua script. Redis orders each operation relative to the evaluation script. An evaluation sees whichever complete policy value is in Redis at its own serialization point; there is no policy version pinning across requests.
+- **After Redis commits but before the client receives the HTTP response:** the response can be lost even though quota was consumed. Retrying can consume quota again; this API currently has no idempotency key or request-deduplication store.
+- **During Redis failover, persistence recovery, or a script runtime error:** atomicity prevents interleaving, but does not guarantee durability or rollback after writes. The local setup is a single Redis node and has no failover contract.
+
+The HTTP contention test sends 100 concurrent requests through two independent `httptest` API servers and expects exactly 17 allows. It then reads quota state through the other instance. The test requires a Redis service and is run in GitHub Actions with Redis available. Algorithm tests also cover token refill and an AND policy where denial by one rule must not partially charge another.
+
+## 6. Configuration and state inspection
+
+`PUT /v1/rules?identifier=...&namespace=...` validates and replaces the complete policy JSON in Redis. Configuration calls must include the configured admin bearer token in the `Authorization` header. `GET` reads the policy. `DELETE` with `name=...` removes one rule atomically; without `name`, it deletes the policy.
+
+Configuration is stored in Redis for this demo so all instances see changes immediately without local caches, database reads, or restarts. This couples policy availability/durability to Redis. A production alternative is ZooKeeper or another durable configuration store as policy source of truth, with API instances holding versioned in-memory snapshots and watching for updates. That lowers policy reads on the request path, but requires reliable watch reconnection, snapshot refresh, version tracking, and acceptance/handling of short propagation lag. It does not replace Redis for the exact globally shared quota state used here.
+
+`GET /v1/state?identifier=...&namespace=...` runs the same quota calculations in read-only mode. It reports current consumption, remaining capacity, and reset time without spending quota or extending state TTL. Since other evaluations can run immediately before or after the read, this is a snapshot, not a reservation or guarantee that the returned balance will still be available to the next request.
+
+## 7. Health, metrics, and errors
+
+- `GET /healthz` currently pings Redis as well as handling the request. It returns 200 when Redis is reachable and 503 otherwise. There is no separate process-only liveness endpoint, so this endpoint is best treated as a combined readiness check.
+- `GET /metrics` emits Prometheus text-format process-local counters for evaluations, allow/deny decisions, and errors. Each instance must be scraped separately and counters reset on process restart. The endpoint does not use Redis and has no authentication in this demo.
+- An allow or deny is a successfully computed evaluation and returns 200. Callers must inspect the `allowed` field. The limiter answers whether the caller may proceed; an upstream application or gateway decides whether to execute the business operation or return HTTP 429 to its caller.
+- A 503 means the service could not safely make a quota decision. Treat it as no permission to proceed (fail closed).
+- The response includes an instance ID but not a unique request ID. There is no retry deduplication. A lost response after consumption is ambiguous to the caller.
+
+## 8. What this implementation does not claim
+
+The local Compose stack is an interview/demo deployment, not production hardening:
+
+- Redis is a single node with no authentication, TLS, Sentinel/Cluster failover, or tested backup/restore. API replicas can scale horizontally, but this Redis configuration is still a single point of failure and a hot-policy serialization bottleneck.
+- `identifier` and `namespace` are accepted from the request. Admin policy writes use one shared bearer token, but evaluation and state inspection are unauthenticated. Put the service behind a trusted identity gateway or implement caller authentication and tenant binding before public exposure.
+- There is no idempotency, request ID, per-tenant authorization, policy audit log, policy version precondition, latency histogram, tracing, or benchmark suite.
+- Redis Lua guarantees non-interleaving on the current primary, not rollback, cross-failover exactly-once behavior, or lossless durability.
+- `GET /healthz` is not split into liveness and readiness probes; metrics are process-local and unauthenticated.
+- ZooKeeper-driven policy snapshots are a documented alternative, not implemented in this repository.
+
+See [README.md](./README.md) for setup, API examples, and test commands. The push and pull-request workflow runs the race-enabled tests against a Redis service, static analysis, and a Go build.
