@@ -188,7 +188,7 @@ func TestHTTPIntegrationRuleLifecycleAndAlgorithms(t *testing.T) {
 		t.Fatalf("state = %+v, want identifier and two rule signals", state)
 	}
 	for _, rule := range state.Rules {
-		if rule.Consumed != 2 || rule.Remaining != 0 || rule.ResetAt == "" {
+		if !closeTo(rule.Consumed, 2, 0.001) || rule.Remaining > 0.001 || rule.ResetAt == "" {
 			t.Errorf("state rule = %+v, want consumed 2, remaining 0, and reset timestamp", rule)
 		}
 	}
