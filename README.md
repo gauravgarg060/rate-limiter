@@ -6,8 +6,6 @@ Each policy is selected by an `(identifier, namespace)` pair—for example, tena
 
 The local demo runs two API instances against the same Redis. Both instances use a Redis Lua script to evaluate and update quota state atomically, so a tenant does not get a separate allowance per API replica.
 
-> This project is an interview/demo implementation, not a hardened public production service. Use [INTERVIEW.md](./INTERVIEW.md) to prepare a demo and design discussion, [CODE_WALKTHROUGH.md](./CODE_WALKTHROUGH.md) to follow a request through the code, and [ARCHITECTURE.md](./ARCHITECTURE.md) for the system diagram, contention guarantees, Redis data model, outage behavior, and production follow-up.
-
 ## Run the service
 
 Choose **Docker Compose** to run the complete demo stack, or **local Go processes** if you do not have Docker. Run these commands from a terminal in the repository root (the directory containing `docker-compose.yml` and `go.mod`).
