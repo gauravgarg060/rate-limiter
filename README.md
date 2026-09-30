@@ -1,32 +1,47 @@
-# Local multi-instance rate limiter
+# Redis-backed rate limiter
 
-A small HTTP rate-limiting service for per-identifier and per-resource quotas across multiple service instances. Both API instances share policy and quota state in Redis; a Redis Lua script evaluates and updates every rule atomically, so concurrent requests cannot spend the same remaining quota twice. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the request flow, contention reasoning, and known limits.
+A Go HTTP service that answers: **may this identifier perform this operation now?**
 
-This is a runnable interview/demo baseline, not a claim that the default local deployment is production-hardened. The Compose Redis instance has no authentication or TLS, configuration uses a demo token by default, and there is no HA Redis topology. Use secrets, network isolation, TLS, monitoring, backups, and a highly available Redis deployment before exposing it to untrusted networks.
+Each policy is selected by an `(identifier, namespace)` pair—for example, tenant `tenant-42` accessing `search`. A policy can contain up to eight named limits. The request is allowed only when every limit permits it.
 
-## Start locally
+The local demo runs two API instances against the same Redis. Both instances use a Redis Lua script to evaluate and update quota state atomically, so a tenant does not get a separate allowance per API replica.
 
-Requires Docker Compose:
+> This project is an interview/demo implementation, not a hardened public production service. Read [ARCHITECTURE.md](./ARCHITECTURE.md) for the request flow, contention guarantees, Redis data model, outage behavior, and production follow-up.
+
+## Run locally with Docker Compose
+
+You need Docker with the Compose plugin. From the repository root, start the stack:
 
 ```sh
 docker compose up --build
 ```
 
-The proxy listens on `http://localhost:8080` and distributes requests over `api1` and `api2`. The instances are also directly available at `http://localhost:8081` and `http://localhost:8082`, respectively, for per-instance metrics scraping and testing. Both instances use the same Redis database. Set `ADMIN_TOKEN` in the environment before starting Compose to replace the local demo token:
+Compose starts:
+
+| Component | Local address | Role |
+| --- | --- | --- |
+| Nginx proxy | `http://localhost:8080` | Distributes requests between both API instances |
+| API instance 1 | `http://localhost:8081` | Handles requests and exposes instance-local metrics |
+| API instance 2 | `http://localhost:8082` | Handles requests and exposes instance-local metrics |
+| Redis | Internal to Compose | Shared policy and quota state; data stored in a named volume |
+
+The admin API uses `local-demo-token` by default. For a different local token, set `ADMIN_TOKEN` when starting Compose and use that same value in admin requests:
 
 ```sh
 ADMIN_TOKEN='replace-with-a-local-secret' docker compose up --build
 ```
 
-Check service health and the active API instance:
+Wait until the services are healthy, then check the proxy:
 
 ```sh
-curl -s http://localhost:8080/healthz
+curl -sS http://localhost:8080/healthz
 ```
 
-## Configure burst and sustained rules
+The health endpoint checks Redis connectivity. It returns 503 when Redis is unavailable. Stop the stack with `Ctrl-C`, or from another terminal run `docker compose down`. The named Redis volume is retained by `down`; deleting the volume also deletes its persisted data.
 
-Create or replace a policy with `PUT /v1/rules`. The pair of rules below permits up to 20 requests in a token bucket refilled at 20 tokens per 10 seconds, while also enforcing a sustained fixed-window limit of 100 requests per minute.
+## Configure a policy
+
+Create or replace a policy using `PUT /v1/rules`. This example gives one tenant a burst limit of 20 tokens, refilled to full over 10 seconds, and a sustained fixed-window limit of 100 requests per minute:
 
 ```sh
 curl -i -X PUT \
@@ -41,74 +56,146 @@ curl -i -X PUT \
   }'
 ```
 
-`capacity` is the maximum number of tokens or fixed-window requests. For token buckets, `period_seconds` is the time to refill an empty bucket to full capacity. For fixed windows, it is the aligned window duration. Each policy can combine either supported algorithm across up to eight named rules.
+`identifier` names the customer or API key being limited. `namespace` names the resource or operation being protected. The combination selects one policy, so the same tenant can have independent limits for `search`, `uploads`, and other resources.
 
-**Algorithm selection:** token bucket is the burst rule: it starts full and refills continuously, allowing short bursts while smoothing sustained traffic. Fixed window is a straightforward sustained quota with an aligned reset. It can allow a boundary burst across adjacent windows, so combine it with a token bucket if strict burst control matters. Rules compose as AND constraints: a request spends capacity in all rules or none.
+### Choose an algorithm
 
-Read a policy, delete one named rule, or delete the whole policy with the same identifier and namespace:
+| Algorithm | What it does | Useful for | Trade-off |
+| --- | --- | --- | --- |
+| `token_bucket` | Starts full and replenishes continuously at `capacity / period_seconds`. A request spends tokens equal to its `cost`. | Short bursts while controlling the average rate over time. | State can contain fractional tokens; retry/reset values are estimates based on current state. |
+| `fixed_window` | Allows up to `capacity` units during each aligned window of `period_seconds`. | Simple periodic quotas, such as 100 requests per minute. | Requests near the end of one window and start of the next can create a boundary burst. |
+
+Use token bucket when smoothing bursts matters. Use fixed window when a simple aligned quota and reset time are useful. Combine them when you want both burst shaping and a sustained ceiling. Rules compose as AND constraints: **all rules must allow the request, and a denied request consumes quota from none of them.**
+
+`capacity` must be 1–1,000,000; `period_seconds` must be 1–86,400. A policy has 1–8 rules, and rule names must be unique.
+
+### Read or change configuration
+
+`GET` reads the complete policy. `PUT` replaces the complete rules list. `DELETE` with `name` removes one named rule; without `name`, it deletes the entire policy. These endpoints require the admin bearer token:
 
 ```sh
-curl -H 'Authorization: Bearer local-demo-token' \
+curl -sS \
+  -H 'Authorization: Bearer local-demo-token' \
   'http://localhost:8080/v1/rules?identifier=tenant-42&namespace=search'
 
-curl -i -X DELETE -H 'Authorization: Bearer local-demo-token' \
+curl -i -X DELETE \
+  -H 'Authorization: Bearer local-demo-token' \
   'http://localhost:8080/v1/rules?identifier=tenant-42&namespace=search&name=burst'
 
-curl -i -X DELETE -H 'Authorization: Bearer local-demo-token' \
+curl -i -X DELETE \
+  -H 'Authorization: Bearer local-demo-token' \
   'http://localhost:8080/v1/rules?identifier=tenant-42&namespace=search'
 ```
 
-Policy changes take effect without restarting the service. `PUT` replaces the complete rules list, so it supports creating and updating rules; use `DELETE` with `name` to remove an individual rule, or without `name` to delete the policy. Updating a rule's algorithm, capacity, or period starts fresh state for that changed rule; unchanged rules retain their state.
+Policies are stored in Redis and take effect without restarting API instances. Changing a rule's name, algorithm, capacity, or period selects a new quota-state key; unchanged rule state is retained. Recreating an identical rule before its old state expires can reuse that state.
 
-## Evaluate and inspect quota
+## Evaluate requests
 
-Each successful evaluation responds with an `allowed` decision, aggregate remaining capacity, reset time, instance identifier, and per-rule consumption. A denial includes `retry_after_ms` and a `Retry-After` header. Evaluation responses use HTTP 200 for both allow and deny; a requested cost larger than any configured rule capacity uses 400, other invalid requests use 4xx, and backend failures use 503.
+Send an evaluation request through the proxy:
 
 ```sh
-curl -s -X POST -H 'Content-Type: application/json' \
+curl -sS -X POST \
+  -H 'Content-Type: application/json' \
   http://localhost:8080/v1/evaluate \
   -d '{"identifier":"tenant-42","namespace":"search","cost":1}'
+```
 
-curl -s \
+`cost` is optional and defaults to 1. It must be positive and cannot exceed any rule's capacity.
+
+Example response (timestamps and fractional values vary with request timing):
+
+```json
+{
+  "allowed": true,
+  "remaining": 19,
+  "reset_at": "2026-09-30T08:40:00Z",
+  "retry_after_ms": 0,
+  "instance_id": "api1",
+  "rules": [
+    {
+      "name": "burst",
+      "algorithm": "token_bucket",
+      "capacity": 20,
+      "consumed": 1,
+      "remaining": 19,
+      "reset_at": "2026-09-30T08:40:00.5Z"
+    },
+    {
+      "name": "sustained",
+      "algorithm": "fixed_window",
+      "capacity": 100,
+      "consumed": 1,
+      "remaining": 99,
+      "reset_at": "2026-09-30T08:41:00Z"
+    }
+  ]
+}
+```
+
+The response also includes `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers; a denial includes `Retry-After`. A successfully computed allow **or deny** returns HTTP 200—callers must check the JSON `allowed` field. The limiter does not execute the protected business operation; an upstream service or gateway decides whether to proceed or return HTTP 429 to its own caller. If the limiter cannot reach Redis, it returns 503 and does not grant permission.
+
+The top-level `remaining` is the smallest numeric remaining amount across the rules. Since rules can have different algorithms and periods, use each rule's `remaining` and `reset_at` fields for the precise quota signal. Retry times are estimates; a subsequent request may see a different balance.
+
+## Inspect current quota
+
+Read state without spending quota:
+
+```sh
+curl -sS \
   'http://localhost:8080/v1/state?identifier=tenant-42&namespace=search'
 ```
 
-`cost` is optional and defaults to 1. State inspection is read-only and returns current consumed and remaining capacity and reset timestamps per rule. Policies are independent for each `(identifier, namespace)` pair.
+The response reports consumed and remaining amounts, plus reset timestamps, per rule. It is a snapshot: another request may change the state immediately after it is read.
 
 ## Endpoints
 
-| Method | Endpoint | Purpose |
-| --- | --- | --- |
-| `PUT` | `/v1/rules?identifier=...&namespace=...` | Create or replace policy (admin bearer token) |
-| `GET` | `/v1/rules?identifier=...&namespace=...` | Read policy (admin bearer token) |
-| `DELETE` | `/v1/rules?identifier=...&namespace=...&name=...` | Delete one rule (omit `name` to delete policy; admin bearer token) |
-| `POST` | `/v1/evaluate` | Atomically evaluate and consume quota |
-| `GET` | `/v1/state?identifier=...&namespace=...` | Read current quota state without consuming |
-| `GET` | `/healthz` | API and Redis health |
-| `GET` | `/metrics` | Prometheus text-format counters |
+| Method | Path | Purpose | Authentication |
+| --- | --- | --- | --- |
+| `POST` | `/v1/evaluate` | Atomically evaluate and consume quota | None in this demo |
+| `GET` | `/v1/state` | Read quota state without consuming | None in this demo |
+| `PUT` | `/v1/rules` | Create or replace policy | Admin bearer token |
+| `GET` | `/v1/rules` | Read policy | Admin bearer token |
+| `DELETE` | `/v1/rules` | Delete a named rule or whole policy | Admin bearer token |
+| `GET` | `/healthz` | Check API and Redis connectivity | None |
+| `GET` | `/metrics` | Read this process's Prometheus counters | None in this demo |
 
-The evaluation and state APIs are intentionally open for this local demo. Place them behind the caller's authenticated gateway before production use. Metrics are process-local counters and should be scraped from each instance; avoid adding raw tenant identifiers as metric labels because that creates unbounded cardinality.
+For the state and policy endpoints, supply `identifier` and `namespace` as query parameters. Evaluation takes both in its JSON request body.
 
-## Local multi-instance demo
+## Tests and CI
 
-The Compose file starts two API containers (`api1`, `api2`), one Redis, and an Nginx round-robin proxy. Make repeated evaluation requests and compare the `instance_id` values: both instances share the same per-tenant quota. To verify the atomic path under load, send concurrent requests against a fresh low-capacity test policy and confirm that no more than the configured capacity is allowed.
-
-## Tests
-
-Unit and HTTP/Redis integration tests:
+Run the validation commands:
 
 ```sh
 go test ./...
+go vet ./...
+go build ./...
 ```
 
-Redis-backed tests use `REDIS_TEST_URL`; without it, those tests are skipped. Start a Redis instance, then run:
+Tests that exercise Redis are skipped unless `REDIS_TEST_URL` points to a reachable Redis instance. To run the complete suite locally:
 
 ```sh
 REDIS_TEST_URL=redis://localhost:6379/0 go test -race ./...
 ```
 
-The suite includes direct Lua algorithm tests, HTTP endpoint lifecycle tests, and a concurrent test issuing 100 requests through two independent API instances and asserting exactly 17 are allowed for a capacity-17 rule. GitHub Actions starts Redis and runs the complete race-enabled suite, `go vet`, and the build on pushes and pull requests.
+The Redis-backed tests check both algorithms, multi-rule all-or-nothing behavior, HTTP policy/evaluation/state endpoints, and 100 concurrent evaluations across two independent API instances. The contention test requires exactly 17 allows against a fresh capacity-17 policy with a slow refill rate; the test deliberately makes refill negligible during the request burst. GitHub Actions starts Redis and runs the race-enabled tests, `go vet`, and the build on pushes and pull requests.
 
-## Known limitations
+## Observability
 
-The Compose configuration is for a local demo: Redis is a single unauthenticated, non-TLS instance with no HA or failover, and it stores both policies and quota state. A production variant could keep policies in ZooKeeper and push versioned updates into API-instance memory, but must handle propagation lag, watcher reconnects, and snapshot bootstrap; this does not eliminate Redis as the shared quota-state dependency. The service returns `503` if Redis is unavailable (fail closed); evaluation and state endpoints rely on an authenticated upstream gateway. Metrics are per-process, Redis is the serialization bottleneck for each hot key, and the solution does not include idempotency, policy audit/versioning, or load benchmarks. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the contention model and follow-up items before production exposure.
+Each API instance exposes `/metrics` with process-local counters for evaluations, allow/deny decisions, and errors. Scrape both instances and aggregate metrics in your monitoring system. The counters reset when an instance restarts; no tenant identifiers are emitted as metric labels.
+
+`/healthz` currently combines process responsiveness with a Redis ping. It can be used as a basic readiness check, but there is no separate process-only liveness endpoint.
+
+## Design limitations and production follow-up
+
+The local stack is intended for a trusted laptop/interview demo:
+
+- **Redis is a single point of failure.** Compose runs one Redis node without HA, authentication, or TLS. The service fails closed with 503 if Redis is unavailable. Lua atomicity protects against concurrent interleaving on the active Redis primary; it does not provide failover or lossless durability.
+- **Policies and quota state share Redis.** Compose enables AOF and a persistent volume for restart recovery, but this is not an independent policy database or a backup strategy. A production design could store policies in ZooKeeper or another durable configuration system and push versioned snapshots into API-instance memory. Redis would still be needed for shared, globally correct quota counters.
+- **Identity is trusted from the request.** The service accepts the supplied `identifier` and `namespace`; evaluation and state endpoints do not authenticate callers. Put it behind a trusted identity gateway or add caller authentication and bind credentials to tenant identity before public exposure.
+- **The admin credential is demo-grade.** The default admin token is public in this README. Replace it locally and use a managed secret plus stronger authorization in any real deployment.
+- **Metrics are basic and unauthenticated.** Counters are per-process, with no latency histograms or tracing. Restrict access to `/metrics` to trusted operators/scrapers in production.
+- **A lost response can lead to repeat consumption.** The service has no idempotency key or retry-deduplication mechanism. If Redis commits a decision but the HTTP response is lost, retrying can charge quota again.
+- **Hot keys serialize.** Redis can distribute work for different policies, but evaluations for one very busy identifier/namespace are serialized to preserve exact shared quotas.
+- **There is no policy audit or version precondition.** `PUT` replaces the full policy. Updates are visible immediately through Redis, but there is no audit log, history, or compare-and-swap version check.
+
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for detailed request sequencing, Redis keys and TTLs, concurrency behavior, and failure analysis.
