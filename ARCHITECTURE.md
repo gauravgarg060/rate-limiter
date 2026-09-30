@@ -5,58 +5,31 @@ This document describes the service in this repository: a Go HTTP API that store
 ## 1. Components and request flow
 
 ```mermaid
-flowchart TB
-    caller[Caller or upstream gateway]
-    admin[Trusted operator]
-    scraper[Metrics scraper]
-    proxy[Nginx local load balancer]
-    api1[Go API instance 1]
-    api2[Go API instance 2]
-    redis[(Shared Redis)]
-
-    caller -->|POST /v1/evaluate| proxy
-    proxy --> api1
-    proxy --> api2
-    caller -->|Optional direct instance access| api1
-    caller -->|Optional direct instance access| api2
-
-    subgraph evaluation[Evaluation path]
-        validate[Validate JSON, identifier, namespace, and cost]
-        script[Run one quota Lua script]
-        loadPolicy[Read policy JSON]
-        loadState[Read state for each named rule]
-        decision{Does every rule have enough capacity?}
-        commit[Write every rule state]
-        result[Return decision, remaining quota, reset, and rule signals]
-        validate --> script
-        script --> loadPolicy
-        loadPolicy --> loadState
-        loadState --> decision
-        decision -->|Yes: consume cost from every rule| commit
-        decision -->|No: leave every quota key unchanged| result
-        commit --> result
-    end
-
-    api1 --> validate
-    api2 --> validate
-    script <-->|Single non-interleaved script execution| redis
-    result -->|HTTP 200 with allowed true or false| caller
-
-    admin -->|PUT, GET, or DELETE /v1/rules| api1
-    admin -->|PUT, GET, or DELETE /v1/rules| api2
-    api1 <-->|Read or atomically change policy| redis
-    api2 <-->|Read or atomically change policy| redis
-
-    caller -->|GET /v1/state| api1
-    caller -->|GET /v1/state| api2
-    api1 -->|Read-only script mode| redis
-    api2 -->|Read-only script mode| redis
-
-    scraper -->|GET /metrics on each instance| api1
-    scraper -->|GET /metrics on each instance| api2
+flowchart LR
+    Caller[Caller or gateway] -->|Evaluate request| Proxy[Nginx load balancer]
+    Proxy --> API1[Go API instance 1]
+    Proxy --> API2[Go API instance 2]
+    API1 -->|Policies and quota checks| Redis[(Shared Redis)]
+    API2 -->|Policies and quota checks| Redis
+    API1 -->|Decision and quota signals| Caller
+    API2 -->|Decision and quota signals| Caller
 ```
 
-Nginx is only part of the local demo. In a deployment without it, a caller or external load balancer can send requests to any API instance. The API instances hold no local quota counters: they all use the same Redis service. The caller's `identifier` and `namespace` select a policy; they are not authenticated by this service, so a real deployment must derive or validate identity at a trusted gateway or add service-side caller authentication.
+### What each component does
+
+- **Caller or gateway** sends an evaluation request with an identifier and namespace.
+- **Nginx** distributes requests across the API instances in the local demo. It is optional; a deployment can use another load balancer or call an instance directly.
+- **Go API instances** validate requests and return decisions. They do not keep their own quota counters.
+- **Redis** stores policies and the shared quota state. Every API instance checks and updates the same Redis state.
+
+### Evaluation request flow
+
+1. The caller sends `POST /v1/evaluate` to either API instance (usually through Nginx).
+2. The API validates the request and asks Redis to evaluate its policy.
+3. Redis runs one Lua script to check all named rules together. If every rule allows the request, Redis records the quota usage; if any rule denies it, none of the rules are charged.
+4. The API returns the allow/deny decision, remaining quota, reset time, and rule details.
+
+Because the quota check and update happen in Redis, requests handled by different API instances share one limit. The caller's identifier and namespace select a policy; this service does not authenticate them, so production deployments should derive or validate identity at a trusted gateway or add caller authentication.
 
 ## 2. One evaluation, step by step
 
@@ -83,7 +56,7 @@ Each rule has a name, algorithm, capacity, and period in seconds.
 - Tokens refill continuously at `capacity / period_seconds` tokens per second, up to the configured capacity.
 - A request of cost `c` is allowed when at least `c` tokens are available; the script subtracts `c` on an allowed decision.
 - The bucket is stored lazily: its saved value and timestamp are used to calculate refill when a request or state read occurs. A read-only state request does not write the newly calculated value back.
-- Token counts can be fractional internally. Reported quota values can therefore contain a small fractional remainder, even when they are close to zero.
+- Token counts remain fractional internally in Redis. In API responses, `remaining` is rounded down to a whole unit so it represents the number of complete cost-1 requests currently available; the underlying fractional balance is preserved for refill and admission decisions.
 
 ### Fixed window
 
@@ -97,7 +70,7 @@ Each rule has a name, algorithm, capacity, and period in seconds.
 
 A policy can combine token-bucket and fixed-window rules. For example, `burst` can allow 20 requests per 10-second refill interval, while `sustained` allows 100 per aligned minute. Both must allow the request. When the request is allowed, its cost is charged against every rule; if one denies it, none of the rules are charged.
 
-The top-level `remaining` field is the smallest remaining capacity across the rules, not a new independent quota. Per-rule fields are the precise values to inspect when diagnosing a decision. For denied decisions, `retry_after_ms` is based on the longest retry estimate among denying rules, because all blocking constraints must clear.
+The top-level `remaining` field is the smallest remaining capacity across the rules, rounded down to a whole unit; it is not a new independent quota. Per-rule `remaining` fields are also rounded down, while Redis keeps fractional token-bucket values for exact refill and admission decisions. For denied decisions, `retry_after_ms` is based on the longest retry estimate among denying rules, because all blocking constraints must clear.
 
 ## 4. Redis keys, persistence, and expiry
 

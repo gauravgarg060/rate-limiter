@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -251,18 +252,20 @@ func (s *service) evaluate(w http.ResponseWriter, r *http.Request) {
 	} else {
 		s.denied.Add(1)
 	}
-	w.Header().Set("X-RateLimit-Remaining", formatNumber(result.Remaining))
+	remaining := math.Floor(result.Remaining)
+	rules := floorRuleRemaining(result.Rules)
+	w.Header().Set("X-RateLimit-Remaining", formatNumber(remaining))
 	w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(result.ResetAtMS/1000, 10))
 	if !result.Allowed {
 		w.Header().Set("Retry-After", strconv.FormatInt((result.RetryAfterMS+999)/1000, 10))
 	}
 	writeJSON(w, http.StatusOK, response{
 		Allowed:      result.Allowed,
-		Remaining:    result.Remaining,
+		Remaining:    remaining,
 		ResetAt:      time.UnixMilli(result.ResetAtMS).UTC().Format(time.RFC3339Nano),
 		RetryAfterMS: result.RetryAfterMS,
 		InstanceID:   s.instanceID,
-		Rules:        result.Rules,
+		Rules:        rules,
 	})
 }
 
@@ -286,11 +289,20 @@ func (s *service) state(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stateResponse{
 		Identifier: identifier,
 		Namespace:  namespace,
-		Remaining:  result.Remaining,
+		Remaining:  math.Floor(result.Remaining),
 		ResetAt:    time.UnixMilli(result.ResetAtMS).UTC().Format(time.RFC3339Nano),
 		InstanceID: s.instanceID,
-		Rules:      result.Rules,
+		Rules:      floorRuleRemaining(result.Rules),
 	})
+}
+
+func floorRuleRemaining(rules []ruleSignal) []ruleSignal {
+	floored := make([]ruleSignal, len(rules))
+	for i, rule := range rules {
+		rule.Remaining = math.Floor(rule.Remaining)
+		floored[i] = rule
+	}
+	return floored
 }
 
 func (s *service) getRules(w http.ResponseWriter, r *http.Request) {

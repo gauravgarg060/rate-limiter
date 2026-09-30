@@ -8,36 +8,139 @@ The local demo runs two API instances against the same Redis. Both instances use
 
 > This project is an interview/demo implementation, not a hardened public production service. Use [INTERVIEW.md](./INTERVIEW.md) to prepare a demo and design discussion, [CODE_WALKTHROUGH.md](./CODE_WALKTHROUGH.md) to follow a request through the code, and [ARCHITECTURE.md](./ARCHITECTURE.md) for the system diagram, contention guarantees, Redis data model, outage behavior, and production follow-up.
 
-## Run locally with Docker Compose
+## Run the service
 
-You need Docker with the Compose plugin. From the repository root, start the stack:
+Choose **Docker Compose** to run the complete demo stack, or **local Go processes** if you do not have Docker. Run these commands from a terminal in the repository root (the directory containing `docker-compose.yml` and `go.mod`).
+
+### Option A: Docker Compose (recommended)
+
+Install Docker Desktop, or Docker Engine with the Compose plugin. Confirm both commands work:
+
+```sh
+docker --version
+docker compose version
+```
+
+Build the API image and start Redis, two API instances, and the Nginx proxy:
 
 ```sh
 docker compose up --build
 ```
 
-Compose starts:
+Keep this terminal open. In a second terminal, check that all services report `Up` or `healthy` and that the proxy can reach the API and Redis:
 
-| Component | Local address | Role |
+```sh
+docker compose ps
+curl -i http://localhost:8080/healthz
+```
+
+The health response should be HTTP 200 and include `"status":"ok"`. The local endpoints are:
+
+| Component | Address | Role |
 | --- | --- | --- |
 | Nginx proxy | `http://localhost:8080` | Distributes requests between both API instances |
-| API instance 1 | `http://localhost:8081` | Handles requests and exposes instance-local metrics |
-| API instance 2 | `http://localhost:8082` | Handles requests and exposes instance-local metrics |
-| Redis | Internal to Compose | Shared policy and quota state; data stored in a named volume |
+| API instance 1 | `http://localhost:8081` | Direct access to instance 1 |
+| API instance 2 | `http://localhost:8082` | Direct access to instance 2 |
+| Redis | Internal to Compose | Shared policy and quota state |
 
-The admin API uses `local-demo-token` by default. For a different local token, set `ADMIN_TOKEN` when starting Compose and use that same value in admin requests:
+Create a small policy, then evaluate it. The admin token defaults to `local-demo-token`:
+
+```sh
+curl -i -X PUT \
+  -H 'Authorization: Bearer local-demo-token' \
+  -H 'Content-Type: application/json' \
+  'http://localhost:8080/v1/rules?identifier=demo-tenant&namespace=search' \
+  -d '{"rules":[{"name":"demo-limit","algorithm":"fixed_window","capacity":2,"period_seconds":60}]}'
+
+curl -sS -X POST \
+  -H 'Content-Type: application/json' \
+  http://localhost:8080/v1/evaluate \
+  -d '{"identifier":"demo-tenant","namespace":"search","cost":1}'
+```
+
+Repeat the evaluation three times: the first two responses should say `"allowed":true`; the third should say `"allowed":false`. To see the shared-quota behavior directly, send requests to `http://localhost:8081/v1/evaluate` and `http://localhost:8082/v1/evaluate`; both instances use the same Redis quota.
+
+Stop the stack with `Ctrl-C` in the first terminal, or run this from the repository root in another terminal:
+
+```sh
+docker compose down
+```
+
+`docker compose down` preserves the named Redis volume. To also delete the persisted policies and quota data, run `docker compose down -v`.
+
+To use a different admin token, set it when starting the stack and send that same value in the `Authorization` header:
 
 ```sh
 ADMIN_TOKEN='replace-with-a-local-secret' docker compose up --build
 ```
 
-Wait until the services are healthy, then check the proxy:
+### Option B: Run Go locally, with Redis
 
-```sh
-curl -sS http://localhost:8080/healthz
-```
+This runs the API directly on your computer. You need Go 1.23 or later, Redis, and `curl`. Install Redis if needed (for example, `sudo apt-get install redis-server` on Ubuntu, or `brew install redis` on macOS).
 
-The health endpoint checks Redis connectivity. It returns 503 when Redis is unavailable. Stop the stack with `Ctrl-C`, or from another terminal run `docker compose down`. The named Redis volume is retained by `down`; deleting the volume also deletes its persisted data.
+Open three terminals, all at the repository root:
+
+1. **Terminal 1 — start Redis** and leave it running:
+
+   ```sh
+   redis-server --bind 127.0.0.1 --port 6379 --appendonly yes
+   ```
+
+2. **Terminal 2 — start API instance 1** and leave it running:
+
+   ```sh
+   REDIS_URL=redis://127.0.0.1:6379/0 ADMIN_TOKEN=local-demo-token INSTANCE_ID=api1 HTTP_ADDR=:8080 go run .
+   ```
+
+3. **Terminal 3 — start API instance 2** and leave it running (optional, but useful for demonstrating shared quotas):
+
+   ```sh
+   REDIS_URL=redis://127.0.0.1:6379/0 ADMIN_TOKEN=local-demo-token INSTANCE_ID=api2 HTTP_ADDR=:8081 go run .
+   ```
+
+   The first `go run` may download Go modules. Wait for the log `listening on ...` from each API process.
+
+4. **Terminal 4 — run the complete printed demo workflow:**
+
+   ```sh
+   bash scripts/demo-workflow.sh
+   ```
+
+   The script checks both health endpoints, creates a fresh policy, reads it through the other instance, sends two allowed evaluations and one denied evaluation across both instances, reads quota state, and prints each instance's Prometheus counters. It needs `curl` and `jq`. To use a non-default admin token or different ports, set `ADMIN_TOKEN`, `API1_URL`, and `API2_URL` before invoking it.
+
+   To demonstrate concurrent traffic against a burst limit of 20 tokens per 10 seconds and a sustained fixed window of 50 requests per 60 seconds, run:
+
+   ```sh
+   bash scripts/concurrent-demo.sh
+   ```
+
+   It launches 30 requests concurrently, alternating between the two API instances, then prints each request ID, its allow/deny result, per-rule quota signals (including `consumed`), and the allowed/denied ID lists. For an allowed evaluation, `consumed` reflects usage after that request; for a denied evaluation, quota is unchanged and it reflects existing usage. The final state output also includes `consumed`. The exact winners may vary between runs because requests race; the total allowed should be around 20 (the token bucket may refill slightly while the concurrent requests are in flight).
+
+   To perform these steps manually instead, verify the API and try a request:
+
+   ```sh
+   curl -i http://localhost:8080/healthz
+   curl -i -X PUT \
+     -H 'Authorization: Bearer local-demo-token' \
+     -H 'Content-Type: application/json' \
+     'http://localhost:8080/v1/rules?identifier=demo-tenant&namespace=search' \
+     -d '{"rules":[{"name":"demo-limit","algorithm":"fixed_window","capacity":2,"period_seconds":60}]}'
+   curl -sS -X POST \
+     -H 'Content-Type: application/json' \
+     http://localhost:8081/v1/evaluate \
+     -d '{"identifier":"demo-tenant","namespace":"search","cost":1}'
+   ```
+
+   `curl` health should return HTTP 200 with `"status":"ok"`. The policy is created through instance 1 and the evaluation above is sent through instance 2; both share the Redis quota. Repeat the evaluation until it returns `"allowed":false`.
+
+Stop each process with `Ctrl-C` in its terminal. This local Redis command stores data in Redis's configured data directory; for throwaway demo data, use Docker Compose's Redis volume instead.
+
+### Common issues
+
+- **`docker: command not found`**: install and start Docker Desktop or Docker Engine with the Compose plugin, or use Option B.
+- **`connection refused` on port 6379**: Redis is not running. Start it before starting the API.
+- **`address already in use`**: another process is using the requested port. Stop that process or choose a different `HTTP_ADDR` and matching `curl` URL.
+- **API exits with `connect to Redis`**: check that Redis is reachable at the `REDIS_URL` configured for the API.
 
 ## Configure a policy
 
@@ -133,7 +236,7 @@ Example response (timestamps and fractional values vary with request timing):
 
 The response also includes `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers; a denial includes `Retry-After`. A successfully computed allow **or deny** returns HTTP 200—callers must check the JSON `allowed` field. The limiter does not execute the protected business operation; an upstream service or gateway decides whether to proceed or return HTTP 429 to its own caller. If the limiter cannot reach Redis, it returns 503 and does not grant permission.
 
-The top-level `remaining` is the smallest numeric remaining amount across the rules. Since rules can have different algorithms and periods, use each rule's `remaining` and `reset_at` fields for the precise quota signal. Retry times are estimates; a subsequent request may see a different balance.
+The top-level `remaining` is the smallest remaining amount across the rules, rounded down to a whole unit. Per-rule `remaining` values are rounded down the same way. This makes the response a conservative count of complete cost-1 units available; Redis still retains fractional token-bucket balances and uses them for admission and refill calculations. Retry times are estimates; a subsequent request may see a different balance.
 
 `retry_after_ms` is omitted when it is zero (normally, on an allowed response). On a denial, it is based on the rules currently blocking the request. A fixed-window rule reports time until its window resets; a token bucket reports time until it has enough tokens for the requested cost. When multiple rules block, the top-level value is the longest of those waits. The per-rule signals identify which rule is blocking and include its retry estimate.
 

@@ -87,7 +87,7 @@ Inside `quotaScript`, each rule selects one algorithm:
 - The saved `value` is the number of tokens; `timestamp` records when that value was saved.
 - On evaluation, the script calculates elapsed milliseconds using Redis server time, refills tokens at `capacity / period`, and caps the result at capacity.
 - It permits cost `c` when the bucket has at least `c` tokens. On an allowed decision it saves `tokens - c`.
-- Token values can be fractional. A read-only state call calculates a current balance but does not persist the calculated refill.
+- Token values can be fractional in Redis. API `remaining` values are rounded down to whole units, while Redis preserves the fractional balance for admission and refill calculations. A read-only state call calculates a current balance but does not persist the calculated refill.
 
 **Fixed window**
 

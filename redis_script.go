@@ -140,10 +140,11 @@ if mode == "consume" and allowed then
     end
     redis.call("HSET", state.key, "value", value, "timestamp", state.timestamp)
     redis.call("PEXPIRE", state.key, state.expires)
-    results[index].consumed = results[index].capacity - value
     if rule.algorithm == "fixed_window" then
+      results[index].consumed = value
       results[index].remaining = math.max(0, results[index].capacity - value)
     else
+      results[index].consumed = results[index].capacity - value
       results[index].remaining = value
       results[index].reset_at_ms = now_ms + math.ceil((results[index].capacity - value) * tonumber(rule.period_seconds) * 1000 / results[index].capacity)
     end

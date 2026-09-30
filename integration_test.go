@@ -170,6 +170,13 @@ func TestHTTPIntegrationRuleLifecycleAndAlgorithms(t *testing.T) {
 	if !decisions[0].Allowed || !decisions[1].Allowed || decisions[2].Allowed {
 		t.Fatalf("decisions = %v, want allow, allow, deny", []bool{decisions[0].Allowed, decisions[1].Allowed, decisions[2].Allowed})
 	}
+	for i, wantConsumed := range []float64{1, 2, 2} {
+		for _, rule := range decisions[i].Rules {
+			if !closeTo(rule.Consumed, wantConsumed, 0.001) {
+				t.Errorf("decision %d rule %q consumed = %v, want %v", i+1, rule.Name, rule.Consumed, wantConsumed)
+			}
+		}
+	}
 	if decisions[1].Remaining != 0 || len(decisions[1].Rules) != 2 {
 		t.Fatalf("second decision = %+v, want zero remaining and both algorithm signals", decisions[1])
 	}
@@ -213,6 +220,75 @@ func TestHTTPIntegrationRuleLifecycleAndAlgorithms(t *testing.T) {
 	metrics, metricsBody := requestJSON(t, instance.client, http.MethodGet, baseURL+"/metrics", "", nil)
 	if metrics.StatusCode != http.StatusOK || !strings.Contains(string(metricsBody), `ratelimiter_decisions_total{result="deny"} 1`) {
 		t.Fatalf("metrics response status=%d body=%s", metrics.StatusCode, metricsBody)
+	}
+}
+
+func TestHTTPRemainingRoundsDownWhileRedisKeepsFractionalTokens(t *testing.T) {
+	redisClient := testRedis(t)
+	identifier, namespace := uniqueIdentifier(t), "fractional"
+	cleanupPolicy(t, redisClient, identifier, namespace)
+	defer cleanupPolicy(t, redisClient, identifier, namespace)
+
+	policy := Policy{
+		Identifier: identifier,
+		Namespace:  namespace,
+		Rules:      []RateRule{{Name: "burst", Algorithm: "token_bucket", Capacity: 20, PeriodSeconds: 10}},
+	}
+	policyJSON, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatalf("marshal policy: %v", err)
+	}
+	ctx := context.Background()
+	if err := redisClient.Set(ctx, policyKey(identifier, namespace), policyJSON, 0).Err(); err != nil {
+		t.Fatalf("store policy: %v", err)
+	}
+	stateKey := fmt.Sprintf("%s:state:burst:token_bucket:20:10000",
+		strings.TrimSuffix(policyKey(identifier, namespace), ":policy"))
+	if err := redisClient.HSet(ctx, stateKey, "value", 2.5, "timestamp", time.Now().UnixMilli()).Err(); err != nil {
+		t.Fatalf("seed fractional token balance: %v", err)
+	}
+
+	instance := startTestInstance(t, redisClient, "fractional-test")
+	stateURL := fmt.Sprintf("%s/v1/state?identifier=%s&namespace=%s",
+		instance.server.URL, url.QueryEscape(identifier), url.QueryEscape(namespace))
+	stateResp, stateBody := requestJSON(t, instance.client, http.MethodGet, stateURL, "", nil)
+	if stateResp.StatusCode != http.StatusOK {
+		t.Fatalf("state status = %d, want %d: %s", stateResp.StatusCode, http.StatusOK, stateBody)
+	}
+	var state stateResponse
+	if err := json.Unmarshal(stateBody, &state); err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+	if state.Remaining != 2 || len(state.Rules) != 1 || state.Rules[0].Remaining != 2 {
+		t.Fatalf("state = %+v, want remaining rounded down to 2", state)
+	}
+
+	evaluateResp, evaluateBody := requestJSON(t, instance.client, http.MethodPost,
+		instance.server.URL+"/v1/evaluate", "", evaluationRequest{
+			Identifier: identifier,
+			Namespace:  namespace,
+			Cost:       1,
+		})
+	if evaluateResp.StatusCode != http.StatusOK {
+		t.Fatalf("evaluation status = %d, want %d: %s", evaluateResp.StatusCode, http.StatusOK, evaluateBody)
+	}
+	var decision response
+	if err := json.Unmarshal(evaluateBody, &decision); err != nil {
+		t.Fatalf("decode evaluation: %v", err)
+	}
+	if !decision.Allowed || decision.Remaining != 1 || decision.Rules[0].Remaining != 1 {
+		t.Fatalf("decision = %+v, want allowed with remaining rounded down to 1", decision)
+	}
+	if got := evaluateResp.Header.Get("X-RateLimit-Remaining"); got != "1" {
+		t.Fatalf("X-RateLimit-Remaining = %q, want 1", got)
+	}
+
+	storedValue, err := redisClient.HGet(ctx, stateKey, "value").Float64()
+	if err != nil {
+		t.Fatalf("read fractional token balance from Redis: %v", err)
+	}
+	if storedValue < 1.5 || storedValue >= 1.6 {
+		t.Fatalf("stored token balance = %v, want fractional value near 1.5", storedValue)
 	}
 }
 
